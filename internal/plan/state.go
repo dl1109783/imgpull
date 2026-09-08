@@ -32,6 +32,8 @@ type stateObject struct {
 	Retries      int        `json:"retries"`
 	LastError    string     `json:"lastError,omitempty"`
 	UpdatedAt    time.Time  `json:"updatedAt"`
+
+	RangeUnsupported bool `json:"rangeUnsupported,omitempty"`
 }
 
 // stateFile is the state.json document.

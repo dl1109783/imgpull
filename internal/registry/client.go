@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -46,6 +47,9 @@ type Client struct {
 	// skipHead latches once HEAD proves useless for this registry (hang or
 	// 405), so later blobs probe with a ranged GET immediately.
 	skipHead atomic.Bool
+	// rangeBlind latches once the registry answers a ranged GET with a full
+	// 200 body: it ignores Range, so aria2 can never resume a .part here.
+	rangeBlind atomic.Bool
 }
 
 // NewClient creates a Client.
@@ -61,6 +65,24 @@ func NewClient(insecure bool) *Client {
 		},
 		headTimeout: 15 * time.Second,
 	}
+}
+
+// NewClientProxy creates a Client whose HTTP probes (blob URL resolution,
+// range checks) go through the given proxy. A nil proxy means direct.
+func NewClientProxy(insecure bool, proxy *url.URL) *Client {
+	c := NewClient(insecure)
+	if proxy != nil {
+		c.probe.Transport = ProxyTransport(proxy)
+	}
+	return c
+}
+
+// ProxyTransport clones the default transport and routes every request
+// through proxy. The result is safe for concurrent use.
+func ProxyTransport(proxy *url.URL) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = http.ProxyURL(proxy)
+	return t
 }
 
 // BlobURL is the canonical registry blob endpoint.
@@ -236,6 +258,11 @@ func (c *Client) resolveViaRangeGet(ctx context.Context, repo name.Repository, d
 		}
 		return &ResolvedURL{URL: next.String(), ExpiresAt: parseURLExpiry(next)}, nil
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
+		if resp.StatusCode == http.StatusOK {
+			// The ranged GET got the full body: this server ignores Range,
+			// so resuming a partial download against it is impossible.
+			c.rangeBlind.Store(true)
+		}
 		var headers []string
 		if header != "" {
 			headers = []string{"Authorization: " + header}
@@ -248,6 +275,36 @@ func (c *Client) resolveViaRangeGet(ctx context.Context, repo name.Repository, d
 	default:
 		return nil, fmt.Errorf("range-probe %s: status %d", url, resp.StatusCode)
 	}
+}
+
+// RangeUnsupported reports whether this registry was caught serving full 200
+// bodies to ranged GETs. Against such a server aria2 cannot continue a .part
+// file: every resume attempt aborts with errorCode 8 (No URI available).
+func (c *Client) RangeUnsupported() bool { return c.rangeBlind.Load() }
+
+// ProbeRangeBlind checks url with a 1-byte ranged GET and reports whether it
+// definitively ignores Range (200 full body instead of 206). Network errors,
+// auth challenges and redirects are inconclusive and report false, so callers
+// only act on a positive verdict when it is safe to discard the .part.
+func (c *Client) ProbeRangeBlind(ctx context.Context, url string, headers []string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Range", "bytes=0-0")
+	for _, h := range headers {
+		if k, v, ok := strings.Cut(h, ":"); ok {
+			req.Header.Set(strings.TrimSpace(k), strings.TrimSpace(v))
+		}
+	}
+	resp, err := c.probe.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode == http.StatusOK
 }
 
 // parseURLExpiry extracts a signed-URL expiry hint from common query

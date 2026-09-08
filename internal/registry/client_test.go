@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -149,6 +150,56 @@ func TestResolveHead405FallsBackToRangeGet(t *testing.T) {
 	}
 }
 
+func TestRangeBlindLatchAndProbe(t *testing.T) {
+	blind := false
+	ps := newProbeServer(t, probeHooks{
+		head: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		},
+		get: func(w http.ResponseWriter, r *http.Request) {
+			if !blind {
+				// Range-capable: answer the probe with 206.
+				w.Header().Set("Content-Range", "bytes 0-0/1000")
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				fmt.Fprint(w, "0")
+				return
+			}
+			// Range-blind mirror: full 200 body regardless of Range.
+			streamFull(w)
+		},
+	})
+	c := NewClient(false)
+
+	if _, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:abc", nil); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if c.RangeUnsupported() {
+		t.Errorf("RangeUnsupported = true, want false while the server honors Range")
+	}
+
+	// Flip the server to Range-blind; the next resolve must latch it.
+	blind = true
+	if _, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:def", nil); err != nil {
+		t.Fatalf("resolve after flip: %v", err)
+	}
+	if !c.RangeUnsupported() {
+		t.Errorf("RangeUnsupported = false, want true after a 200 to the ranged probe")
+	}
+
+	// ProbeRangeBlind: definitive 200 → true; 206 and error → false.
+	if !c.ProbeRangeBlind(context.Background(), ps.s.URL+"/v2/some/app/blobs/sha256:x", nil) {
+		t.Errorf("ProbeRangeBlind = false, want true against a 200-to-Range server")
+	}
+	blind = false
+	if c.ProbeRangeBlind(context.Background(), ps.s.URL+"/v2/some/app/blobs/sha256:x", nil) {
+		t.Errorf("ProbeRangeBlind = true, want false against a 206 server")
+	}
+	if c.ProbeRangeBlind(context.Background(), "http://127.0.0.1:1/nope", nil) {
+		t.Errorf("ProbeRangeBlind = true, want false on a connection error")
+	}
+}
+
 func TestResolveSignedRedirectCrossHost(t *testing.T) {
 	ps := newProbeServer(t, probeHooks{
 		head: func(w http.ResponseWriter, r *http.Request) {
@@ -202,5 +253,54 @@ func TestResolveUnauthorizedRetriesThenFails(t *testing.T) {
 	}
 	if head, _ := ps.calls(); head != 3 {
 		t.Errorf("HEAD calls = %d, want 3 (retry budget)", head)
+	}
+}
+
+// TestNewClientProxyRoutesProbes resolves against a registry host that is
+// unreachable directly (RFC 2606 .test domain); the only way the probe can
+// succeed is through the configured forward proxy.
+func TestNewClientProxyRoutesProbes(t *testing.T) {
+	var seenHost, seenScheme string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHost = r.Host
+		seenScheme = r.URL.Scheme
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+	pu, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repo := name.MustParseReference("registry.example.test/org/app", name.Insecure).Context()
+	c := NewClientProxy(true, pu)
+	res, err := c.ResolveBlobURL(context.Background(), repo, "sha256:abc", nil)
+	if err != nil {
+		t.Fatalf("resolve via proxy: %v", err)
+	}
+	if want := "http://registry.example.test/v2/org/app/blobs/sha256:abc"; res.URL != want {
+		t.Errorf("URL = %q, want %q", res.URL, want)
+	}
+	if seenHost != "registry.example.test" || seenScheme != "http" {
+		t.Errorf("proxy saw host=%q scheme=%q, want registry.example.test/http", seenHost, seenScheme)
+	}
+}
+
+func TestProxyTransportChoosesProxy(t *testing.T) {
+	pu, err := url.Parse("http://192.0.2.7:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := ProxyTransport(pu)
+	req := &http.Request{URL: &url.URL{Scheme: "https", Host: "registry-1.docker.io"}}
+	got, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != pu {
+		t.Errorf("Proxy(req) = %v, want %v", got, pu)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("ProxyTransport must not mutate the default transport")
 	}
 }

@@ -128,6 +128,31 @@ func TestBuildAndResume(t *testing.T) {
 	}
 }
 
+func TestRangeUnsupportedPersists(t *testing.T) {
+	root := t.TempDir()
+	ref, mfst, _ := mkManifest(t)
+
+	p1, err := Build(ref, mfst, mfst.Platform, root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer := p1.Objects[1]
+	p1.MarkRangeUnsupported(layer)
+	p1.Release()
+
+	// The flag must survive the state round-trip into a rebuilt plan.
+	p2, err := Build(ref, mfst, mfst.Platform, root, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Release()
+	for _, ob := range p2.Objects {
+		if ob.Digest == layer.Digest && !ob.RangeUnsupported {
+			t.Error("RangeUnsupported flag was not adopted from state.json")
+		}
+	}
+}
+
 func TestDifferentManifestReconciles(t *testing.T) {
 	root := t.TempDir()
 	ref, mfst, _ := mkManifest(t)

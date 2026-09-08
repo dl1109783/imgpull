@@ -5,12 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
@@ -70,13 +75,110 @@ type ImageManifest struct {
 	Architecture string
 }
 
+// ManifestFetchOptions tunes manifest fetching robustness. Zero fields fall
+// back to the defaults (3 attempts, 60s per attempt). Log may be nil.
+type ManifestFetchOptions struct {
+	Attempts      int
+	PerTryTimeout time.Duration
+	// Proxy routes manifest requests through this proxy; nil = direct.
+	Proxy *url.URL
+	// Log receives retry warnings; may be nil.
+	Log func(format string, args ...any)
+}
+
 // ResolveManifest fetches the top-level manifest for ref (following index →
-// platform selection), returning the single-platform image manifest. Handles
-// nested indexes and unknown content types.
+// platform selection), returning the single-platform image manifest. Uses the
+// default fetch policy: per-attempt timeout and retries on transient errors.
 func ResolveManifest(ctx context.Context, ref name.Reference, plat *Platform,
 	keychain authn.Keychain) (*ImageManifest, error) {
+	return ResolveManifestOpts(ctx, ref, plat, keychain, ManifestFetchOptions{})
+}
+
+// ResolveManifestOpts is ResolveManifest with an explicit fetch policy. Each
+// attempt walks the whole index→manifest chain under a per-attempt deadline;
+// timeouts, network errors and 5xx/429 are retried with a short backoff.
+func ResolveManifestOpts(ctx context.Context, ref name.Reference, plat *Platform,
+	keychain authn.Keychain, opts ManifestFetchOptions) (*ImageManifest, error) {
+	attempts := opts.Attempts
+	if attempts <= 0 {
+		attempts = 3
+	}
+	timeout := opts.PerTryTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	logf := opts.Log
+
+	var lastErr error
+	attempt := 0
+	for attempt = 1; ; attempt++ {
+		tryCtx, cancel := context.WithTimeout(ctx, timeout)
+		m, err := resolveManifestOnce(tryCtx, ref, plat, keychain, opts)
+		cancel()
+		if err == nil {
+			return m, nil
+		}
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			// User abort (or run-level shutdown): never retry.
+			return nil, err
+		}
+		lastErr = err
+		if attempt >= attempts || !retryableFetchErr(err) {
+			break
+		}
+		backoff := time.Duration(attempt) * time.Second
+		if logf != nil {
+			logf("manifest fetch failed (%v); retrying in %s (attempt %d/%d)", err, backoff, attempt+1, attempts)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	if isTimeout(lastErr) {
+		return nil, fmt.Errorf("manifest fetch failed after %d attempt(s): %w — the registry/mirror is not responding, check the mirror service",
+			attempt, lastErr)
+	}
+	return nil, fmt.Errorf("manifest fetch failed after %d attempt(s): %w", attempt, lastErr)
+}
+
+// retryableFetchErr classifies manifest-fetch failures: HTTP 5xx/429, any
+// transport-level error (conn refused, TLS, timeout) and deadlines are worth
+// another attempt; 4xx statuses are definitive.
+func retryableFetchErr(err error) bool {
+	var terr *transport.Error
+	if errors.As(err, &terr) {
+		return terr.StatusCode >= 500 || terr.StatusCode == http.StatusTooManyRequests
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var uerr *url.Error
+	return errors.As(err, &uerr) && uerr.Timeout()
+}
+
+func resolveManifestOnce(ctx context.Context, ref name.Reference, plat *Platform,
+	keychain authn.Keychain, fetch ManifestFetchOptions) (*ImageManifest, error) {
 	const maxDepth = 4
-	opts := []remote.Option{remote.WithContext(ctx)}
+	opts := []remote.Option{
+		remote.WithContext(ctx),
+		// ggcr's internal retry would eat the per-attempt deadline silently;
+		// the caller-level policy in ResolveManifestOpts owns retries (and
+		// logs them).
+		remote.WithRetryPredicate(func(error) bool { return false }),
+	}
+	if fetch.Proxy != nil {
+		opts = append(opts, remote.WithTransport(ProxyTransport(fetch.Proxy)))
+	}
 	if keychain != nil {
 		opts = append(opts, remote.WithAuthFromKeychain(keychain))
 	}

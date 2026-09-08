@@ -65,6 +65,9 @@ func isNonRetryable(err error) bool {
 //	 3  resource not found → fatal for that URL
 //	 4  max tries          → retryable (our own loop decides when to stop)
 //	 7  unfinished         → retryable
+//	 8  no URI available   → retryable (handled in waitTask: probe the source;
+//	                           a Range-blind mirror rejects resumes with this
+//	                           code and the .part is discarded before retry)
 //	 9  not enough disk    → fatal
 //	10 out of disk space   → fatal
 //	11 range not supported → cleanup (server won't resume)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -124,6 +125,16 @@ func NewAuthenticator(repo name.Repository, keychain authn.Keychain, insecure bo
 		client:    &http.Client{Timeout: 60 * time.Second},
 		userAgent: userAgent,
 	}
+}
+
+// NewAuthenticatorProxy is NewAuthenticator with token-endpoint requests
+// routed through proxy (nil = direct).
+func NewAuthenticatorProxy(repo name.Repository, keychain authn.Keychain, insecure bool, proxy *url.URL) *Authenticator {
+	a := NewAuthenticator(repo, keychain, insecure)
+	if proxy != nil {
+		a.client.Transport = ProxyTransport(proxy)
+	}
+	return a
 }
 
 // Header returns a usable Authorization header value ("" for anonymous).

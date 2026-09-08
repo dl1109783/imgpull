@@ -36,6 +36,7 @@ type fakeRegistry struct {
 	blobs       map[string][]byte // digest → content
 	cdn         *httptest.Server  // when set, blob HEAD redirects here
 	requireAuth bool
+	rangeBlind  bool // GET serves full 200 body regardless of Range
 	tokens      int
 	seenTokens  []string
 }
@@ -90,6 +91,13 @@ func (f *fakeRegistry) handle(w http.ResponseWriter, r *http.Request) {
 		if f.cdn != nil && r.Method == http.MethodHead {
 			// Simulate registry redirecting to a signed CDN URL.
 			http.Redirect(w, r, f.cdn.URL+"/blob/"+digest, http.StatusFound)
+			return
+		}
+		if f.rangeBlind && r.Method == http.MethodGet {
+			// Range-blind mirror: full 200 body regardless of Range.
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			w.WriteHeader(200)
+			w.Write(data)
 			return
 		}
 		serveWithRange(w, r, data)
@@ -165,12 +173,18 @@ type fakeAria2 struct {
 	seenURLs map[string]string // out name → last submitted URL
 	failOnce map[string]bool   // out name → first attempt fails midway
 	corrupt  map[string]bool   // out name → complete with wrong bytes
+	// failCodeOnce makes the next resume attempt abort with the given
+	// aria2 errorCode before any bytes are fetched (e.g. "8").
+	failCodeOnce map[string]string
+	// lastOpts is the option map of the most recent addUri call.
+	lastOpts map[string]interface{}
 }
 
 func newFakeAria2() *fakeAria2 {
 	return &fakeAria2{
 		tasks: map[string]*fakeTask{}, seenURLs: map[string]string{},
 		failOnce: map[string]bool{}, corrupt: map[string]bool{},
+		failCodeOnce: map[string]string{}, lastOpts: map[string]interface{}{},
 	}
 }
 
@@ -270,6 +284,7 @@ func (a *fakeAria2) addURI(w http.ResponseWriter, req *rpcRequest) {
 	}
 	a.tasks[gid] = t
 	a.seenURLs[t.out] = url
+	a.lastOpts = opts
 	a.mu.Unlock()
 	writeRPC(w, rpcResponse{ID: req.ID, Result: json.RawMessage(fmt.Sprintf("%q", gid))})
 	go a.run(t)
@@ -289,11 +304,15 @@ func (a *fakeAria2) run(t *fakeTask) {
 	out := t.out
 	shouldFail := a.failOnce[out]
 	shouldCorrupt := a.corrupt[out]
+	injectCode := a.failCodeOnce[out]
 	if shouldFail {
 		a.failOnce[out] = false
 	}
 	if shouldCorrupt {
 		a.corrupt[out] = false
+	}
+	if injectCode != "" {
+		a.failCodeOnce[out] = ""
 	}
 	a.mu.Unlock()
 
@@ -301,6 +320,12 @@ func (a *fakeAria2) run(t *fakeTask) {
 	offset := int64(0)
 	if fi, err := os.Stat(part); err == nil {
 		offset = fi.Size()
+	}
+	if injectCode != "" && offset > 0 {
+		// Reject the resume before fetching anything, like aria2 aborting
+		// on a bad/expired URL or a Range-blind source.
+		a.failTask(t, injectCode, "No URI available.")
+		return
 	}
 	req, err := http.NewRequest(http.MethodGet, t.url, nil)
 	if err != nil {
@@ -329,13 +354,17 @@ func (a *fakeAria2) run(t *fakeTask) {
 	var data []byte
 	var total int64
 	if resp.StatusCode == 200 && offset > 0 {
-		// Server ignored Range: restart from scratch.
-		data, _ = io.ReadAll(resp.Body)
-		total = int64(len(data))
-	} else {
-		data, _ = io.ReadAll(resp.Body)
-		total = resp.ContentLength + offset
+		// Server ignored the resume Range: real aria2 aborts here with
+		// errorCode 8 ("Invalid range header" → no URI available).
+		a.failTask(t, "8", "No URI available.")
+		return
 	}
+	data, err = io.ReadAll(resp.Body)
+	if err != nil {
+		a.failTask(t, "1", err.Error())
+		return
+	}
+	total = resp.ContentLength + offset
 	if shouldFail && len(data) > 1 {
 		// Write half then fail like a network cut.
 		f, _ := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -521,6 +550,17 @@ func (e *testEnv) runScheduler(ctx context.Context, p *plan.Plan, maxRetries int
 	return s.Run(ctx)
 }
 
+// runSchedulerProxy is runScheduler with an aria2 all-proxy configured.
+func (e *testEnv) runSchedulerProxy(ctx context.Context, p *plan.Plan, maxRetries int, proxy string) error {
+	e.t.Helper()
+	rpc := NewRPC(e.ariaSrv.URL, "")
+	client := registry.NewClient(true)
+	auth := registry.NewAuthenticator(e.repo, registry.BuildKeychain("", ""), true)
+	s := NewScheduler(rpc, client, auth, e.repo, p,
+		SchedulerOptions{Concurrency: 3, MaxRetries: maxRetries, ProgressInterval: 100 * time.Millisecond, Proxy: proxy})
+	return s.Run(ctx)
+}
+
 func (e *testEnv) assertAllCommitted(p *plan.Plan) {
 	e.t.Helper()
 	for _, t := range p.Objects {
@@ -653,6 +693,78 @@ func TestSchedulerCorruptPartRedownloads(t *testing.T) {
 	}
 }
 
+func TestSchedulerRangeBlindMirrorRestartsPart(t *testing.T) {
+	e := newTestEnv(t, false /*direct*/, false)
+	e.reg.rangeBlind = true
+
+	p := e.buildPlan()
+	defer p.Release()
+
+	// Seed a stale partial for the biggest object, as a previous run would
+	// have left behind on a mirror that ignores Range requests.
+	var biggest *plan.ObjectTask
+	for _, ob := range p.Objects {
+		if biggest == nil || ob.Size > biggest.Size {
+			biggest = ob
+		}
+	}
+	content := e.reg.blobs[biggest.Digest]
+	part := p.PartPath(biggest)
+	if err := os.WriteFile(part, content[:len(content)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part+".aria2", []byte("control"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without the fix this loops: resume → 200 → code 8 → retry, ×5.
+	if err := e.runScheduler(context.Background(), p, 4); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+	e.assertAllCommitted(p)
+	if biggest.Retries < 1 {
+		t.Errorf("retries = %d, want >= 1 after the code-8 resume failure", biggest.Retries)
+	}
+	if !biggest.RangeUnsupported {
+		t.Errorf("RangeUnsupported = false, want true after the probe confirmed the mirror")
+	}
+}
+
+func TestSchedulerCode8KeepsPartWhenRangeWorks(t *testing.T) {
+	e := newTestEnv(t, false, false)
+	p := e.buildPlan()
+	defer p.Release()
+
+	var biggest *plan.ObjectTask
+	for _, ob := range p.Objects {
+		if biggest == nil || ob.Size > biggest.Size {
+			biggest = ob
+		}
+	}
+	content := e.reg.blobs[biggest.Digest]
+	part := p.PartPath(biggest)
+	if err := os.WriteFile(part, content[:len(content)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject one code-8 abort (e.g. a momentarily bad URL) against a
+	// Range-capable registry: the partial must survive and be reused.
+	e.aria.mu.Lock()
+	e.aria.failCodeOnce[biggest.PartName] = "8"
+	e.aria.mu.Unlock()
+
+	if err := e.runScheduler(context.Background(), p, 4); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+	e.assertAllCommitted(p)
+	if biggest.Retries < 1 {
+		t.Errorf("retries = %d, want >= 1 after the injected code-8 failure", biggest.Retries)
+	}
+	if biggest.RangeUnsupported {
+		t.Errorf("RangeUnsupported = true, want false: the probe proved Range works")
+	}
+}
+
 func TestSchedulerTokenAuth(t *testing.T) {
 	e := newTestEnv(t, false, true /*requireAuth*/)
 	p := e.buildPlan()
@@ -667,6 +779,41 @@ func TestSchedulerTokenAuth(t *testing.T) {
 	defer e.reg.mu.Unlock()
 	if e.reg.tokens == 0 {
 		t.Error("registry never issued a token")
+	}
+}
+
+func TestSchedulerPassesProxyToAria2(t *testing.T) {
+	const proxy = "http://192.0.2.7:1080"
+	e := newTestEnv(t, false, false)
+	p := e.buildPlan()
+	defer p.Release()
+
+	ctx := context.Background()
+	if err := e.runSchedulerProxy(ctx, p, 5, proxy); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+	e.assertAllCommitted(p)
+	e.aria.mu.Lock()
+	defer e.aria.mu.Unlock()
+	if got := e.aria.lastOpts["all-proxy"]; got != proxy {
+		t.Errorf("addUri all-proxy = %v, want %q", got, proxy)
+	}
+}
+
+func TestSchedulerNoProxyByDefault(t *testing.T) {
+	e := newTestEnv(t, false, false)
+	p := e.buildPlan()
+	defer p.Release()
+
+	ctx := context.Background()
+	if err := e.runScheduler(ctx, p, 5); err != nil {
+		t.Fatalf("scheduler: %v", err)
+	}
+	e.assertAllCommitted(p)
+	e.aria.mu.Lock()
+	defer e.aria.mu.Unlock()
+	if got, ok := e.aria.lastOpts["all-proxy"]; ok {
+		t.Errorf("addUri unexpectedly carried all-proxy = %v", got)
 	}
 }
 

@@ -16,6 +16,7 @@ aria2 只负责"下载一个 URL 到一个文件"，**不会**整体拉镜像；
 - **实时进度与速度**：终端下显示动态面板——汇总行（已完成/总对象数、已下载/总字节、百分比、聚合速度、耗时）+ 每个在途对象一行的进度条与单独速度；管道/重定向时自动退化为周期汇总日志行。✓ 提交、重试、警告等事件行会先擦除面板再打印，不会与进度条交错错位。
 - **崩溃恢复**：启动时读取 `state.json`，核对 `blobs/` 中已有文件、识别孤儿 `.part` 并交给 aria2 续传；全部就绪后才组装 `index.json`。
 - **目录锁**：同一镜像目录用 `flock` 互斥，多进程并发拉取同一镜像不会互相踩踏。
+- **代理支持**：`--proxy`（`-x`）为 registry 访问与 aria2 层下载统一设置代理（http/https 全覆盖；socks5 仅 registry），适合 docker.io 被 DNS 污染、直连不通的环境。
 
 ## 安装
 
@@ -49,6 +50,9 @@ imgpull quay.io/org/app:1.2 -r http://127.0.0.1:6800/jsonrpc -s TOKEN
 imgpull docker.io/library/alpine:3.20 -e docker-archive
 docker load -i ./docker.io/library/alpine/3.20/image.tar
 
+# 通过代理访问被污染/被墙的镜像仓库（registry 与层下载都走代理）
+imgpull docker.io/library/alpine:latest -x http://192.168.0.7:1080
+
 # 私有仓库（凭据默认读 docker login 配置，登录过就不用传；http registry 加 -k）
 imgpull registry.local:5000/dev/foo:main -k
 ```
@@ -66,7 +70,7 @@ imgpull: ✓ layer b05093807bb0 (2.1 MiB) [2/2]
 
 输出重定向到管道/文件时退化为每隔几秒一行汇总日志（`progress N/M files committed | … | …/s | … active`），不会刷屏。
 
-镜像源对未缓存的 blob 回源较慢时（如某些高校/公益镜像），对象会先停在 `preparing…`；imgpull 会自动把 HEAD 探测降级为 GET 探测避免无限等待，超过 10 秒还会打一行 `resolving … took Ns (slow origin pull on the mirror?)` 提示。
+镜像源对未缓存的 blob 回源较慢时（如某些高校/公益镜像），对象会先停在 `preparing…`；imgpull 会自动把 HEAD 探测降级为 GET 探测避免无限等待，超过 10 秒还会打一行 `resolving … took Ns (slow origin pull on the mirror?)` 提示。manifest 抓取自带每次 60 秒超时与最多 3 次自动重试（重试有日志），镜像源坏掉时会在几分钟内明确报错，不会无限卡住。
 
 ## 全部选项
 
@@ -81,6 +85,7 @@ imgpull: ✓ layer b05093807bb0 (2.1 MiB) [2/2]
 | `--export FORMAT` | `-e` | 空 | `docker-archive`：额外写出 `image.tar` |
 | `--username` / `--password` | `-u` / `-P` | 读 `~/.docker/config.json` | registry 凭据；默认使用 docker login 的登录凭据 |
 | `--insecure` | `-k` | false | 用 `http://` 访问 registry |
+| `--proxy URL` | `-x` | 无代理 | 为 registry 访问与 aria2 下载统一设置代理；支持 `http://`、`https://`、`socks5://` |
 | `--verify` | `-V` | false | 启动时对已提交 blob 重新做 SHA-256 校验 |
 | `--version` | `-v` | — | 打印版本 |
 | `--help` | `-h` | — | 帮助 |
@@ -92,6 +97,21 @@ imgpull: ✓ layer b05093807bb0 (2.1 MiB) [2/2]
 imgpull 默认读取 **docker 配置文件**（`~/.docker/config.json`，可用 `$DOCKER_CONFIG` 改路径），即 `docker login` 保存的各 registry 凭据——登录过的仓库直接拉取，无需传参。credential helper（如 `docker-credential-*`）同样支持。
 
 显式传 `-u user -P pass` 时优先使用显式凭据；两者都没有时按匿名拉取。
+
+## 代理
+
+`--proxy`（简写 `-x`）为两类网络访问统一设置代理，适合 docker.io 被 DNS 污染、只能走代理的环境：
+
+```bash
+imgpull docker.io/library/alpine:latest -x http://192.168.0.7:1080
+```
+
+- **`http://` / `https://`**：同时作用于 registry API（token 鉴权、manifest 抓取、blob URL 解析，经 Go `http.Transport` 代理）与 aria2 的每个下载任务（按任务下发 `all-proxy` 选项，自建守护进程与 `-r` 指定的外部守护进程都生效）。
+- **`socks5://`**：仅作用于 registry API——aria2 不支持 SOCKS，层下载会保持直连。需要层下载也走代理时请用 `http://` 形式的地址（Clash/mihomo 的 `mixed-port` 两种协议都接受，直接填 `http://IP:端口` 即可）。
+- imgpull 与 aria2 守护进程之间的本机 RPC（127.0.0.1）不经过代理。
+- 其它写法（如缺少协议前缀、不支持的 scheme）会在启动时报参数错误退出（exit 2）。
+
+**注意**：若代理客户端运行在本机（如 mihomo/Clash），且规则中含有 `PROCESS-NAME,aria2c,DIRECT` 这类“下载工具强制直连”的规则，由于 mihomo 规则自上而下匹配，这类规则会把 aria2 的流量抢在域名规则之前改为直连——表现为 curl 走代理正常、aria2 却 TLS 握手失败。需要把对应镜像仓库的域名规则（如 `DOMAIN-SUFFIX,docker.io,节点选择`）放到这些 PROCESS-NAME 规则**之前**才能生效。
 
 ## 目录布局
 
@@ -131,7 +151,7 @@ imgpull 默认自行拉起一个 aria2c 守护进程（任务结束自动退出�
 --continue=true --split=1 --max-connection-per-server=1 --file-allocation=none
 ```
 
-每任务附加 `checksum`（`sha-256=<hex>`），aria2 完成时也会先自校验一遍；旧版 aria2 不认识该选项时自动降级重试。不透明 URL（如 307 跳转后的 CDN 签名地址）过期时，imgpull 会重新解析签名并保留断点文件重提任务。
+每任务附加 `checksum`（`sha-256=<hex>`），aria2 完成时也会先自校验一遍；旧版 aria2 不认识该选项时自动降级重试。设置了 `--proxy` 时每任务还会附加 `all-proxy` 选项，把代理下发给 aria2 的每个下载任务（见「代理」）。不透明 URL（如 307 跳转后的 CDN 签名地址）过期时，imgpull 会重新解析签名并保留断点文件重提任务。
 
 ## 开发
 
@@ -158,13 +178,23 @@ internal/fsx, verify    # 原子文件写、SHA-256/大小校验
 
 ### 测试覆盖
 
-- 单元测试：短参数展开、reference 解析、SHA-256 校验、plan 状态机/续传对账、aria2 RPC 协议、失败分类与退避上界、进度面板渲染（进度条、汇总行、TTY 擦除重绘与事件行穿插）。
+- 单元测试：短参数展开、reference 解析、SHA-256 校验、plan 状态机/续传对账、aria2 RPC 协议、失败分类与退避上界、进度面板渲染（进度条、汇总行、TTY 擦除重绘与事件行穿插）、代理参数解析与代理下发（registry 传输层、aria2 任务选项）。
 - 集成测试（`TestRealAria2*`）：拉起**真实 aria2c** 守护进程 + httptest 模拟 registry（含 token 鉴权、307 签名 URL、限速服务端），覆盖限速下载、杀进程中断后按 Range 断点续传、`.part` 校验失败重下等场景。
 
 ## 已知问题（中国大陆网络）
 
-`docker.io` 在部分地区存在 DNS 污染，直连会超时。可用镜像源代替（语法不变，替换 registry 即可）：
+`docker.io` 在部分地区存在 DNS 污染，直连会超时。可用镜像源代替（语法不变，替换 registry 即可），或用 `--proxy` 让 registry 与层下载都走代理：
 
 ```bash
 imgpull docker.m.daocloud.io/library/nginx:latest
+imgpull docker.io/library/nginx:latest -x http://192.168.0.7:1080
 ```
+
+### 不支持断点续传的镜像源
+
+部分镜像源（如 ghcr.nju.edu.cn 的部分场景）对 `Range` 请求返回完整 200 响应，
+aria2 无法在其上续传 `.part` 文件（报 `code 8: No URI available.`）。imgpull
+0.2.3 起会自动探测这种情况：一旦确认源站无视 Range，就丢弃已有分片从头下载，
+并打印 `source ignores Range requests; discarding … partial` 提示。在此类源上
+中断重跑意味着该层从头下载，属预期行为；若希望获得可续传的下载，请改用支持
+Range 的源或官方 registry。

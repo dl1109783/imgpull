@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,7 +27,7 @@ import (
 	"imgpull/internal/registry"
 )
 
-const imgpullVersion = "0.2.1"
+const imgpullVersion = "0.2.4"
 
 // valueFlags are options whose value may be the next argv element.
 var valueFlags = map[string]bool{
@@ -39,6 +40,7 @@ var valueFlags = map[string]bool{
 	"export":       true,
 	"username":     true,
 	"password":     true,
+	"proxy":        true,
 }
 
 // shortFlags maps single-letter aliases to their long flag names. Letter
@@ -57,6 +59,7 @@ var shortFlags = map[string]string{
 	"P": "password",
 	"k": "insecure",
 	"V": "verify",
+	"x": "proxy",
 }
 
 // splitPositional extracts the image reference (first non-flag argument) so
@@ -127,6 +130,7 @@ Examples:
   imgpull docker.io/library/nginx:latest -p linux/amd64 -o ./nginx -c 3
   imgpull quay.io/org/app:1.2 -r http://127.0.0.1:6800/jsonrpc
   imgpull registry.local:5000/dev/foo:main -k
+  imgpull docker.io/library/alpine:latest -x http://192.168.0.7:1080
 
 Flags:
   -p, --platform OS/ARCH[/VARIANT]   target platform (default: linux/amd64)
@@ -135,6 +139,7 @@ Flags:
   -s, --aria2-secret TOKEN           RPC secret for the external daemon
   -c, --concurrency N                layers downloaded in parallel (default 3)
   -R, --max-retries N                retry attempts per layer (default 5)
+  -x, --proxy URL                    proxy for registry access and layer downloads (http/https/socks5)
   -e, --export FORMAT                "docker-archive" also writes image.tar (docker load)
   -u, --username / -P, --password    registry credentials (default: read from docker login config)
   -k, --insecure                     use http:// for the registry
@@ -171,6 +176,7 @@ func run(args []string) int {
 	exportFlag := fs.String("export", "", "export format: '' or 'docker-archive'")
 	username := fs.String("username", "", "registry username (default: read from docker config)")
 	password := fs.String("password", "", "registry password")
+	proxyFlag := fs.String("proxy", "", "proxy URL for registry + downloads (e.g. http://192.168.0.7:1080)")
 	insecure := fs.Bool("insecure", false, "use http:// registry")
 	verifyFlag := fs.Bool("verify", false, "re-verify committed blobs on startup")
 	showVersion := fs.Bool("version", false, "print version")
@@ -210,6 +216,7 @@ func run(args []string) int {
 		export:       *exportFlag,
 		username:     *username,
 		password:     *password,
+		proxy:        *proxyFlag,
 		insecure:     *insecure,
 		verify:       *verifyFlag,
 	})
@@ -226,11 +233,46 @@ type pullConfig struct {
 	export       string
 	username     string
 	password     string
+	proxy        string
 	insecure     bool
 	verify       bool
 }
 
+// parseProxy validates the --proxy value: nil when empty, otherwise a URL
+// with one of the supported schemes (http, https for both registry and
+// aria2; socks5 registry-only).
+func parseProxy(s string) (*url.URL, error) {
+	if s == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("invalid --proxy %q (want e.g. http://192.168.0.7:1080)", s)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5":
+		return u, nil
+	default:
+		return nil, fmt.Errorf("unsupported --proxy scheme %q (use http, https or socks5)", u.Scheme)
+	}
+}
+
 func pull(ctx context.Context, cfg pullConfig) int {
+	// 0. Proxy validation.
+	proxyURL, err := parseProxy(cfg.proxy)
+	if err != nil {
+		log.Println(err)
+		return 2
+	}
+	if proxyURL != nil {
+		log.Printf("using proxy %s", cfg.proxy)
+		if proxyURL.Scheme == "socks5" {
+			// Go dials SOCKS5 natively, but aria2 only understands http/https
+			// proxies, so layer downloads stay direct in that case.
+			log.Printf("warning: aria2 does not support SOCKS proxies — %s applies to registry access only, layers download directly", cfg.proxy)
+		}
+	}
+
 	// 1. Reference + platform.
 	ref, err := reference.Parse(cfg.image, cfg.insecure)
 	if err != nil {
@@ -249,9 +291,12 @@ func pull(ctx context.Context, cfg pullConfig) int {
 	keychain := registry.BuildKeychain(cfg.username, cfg.password)
 
 	// 2. Resolve the single-platform manifest via go-containerregistry.
-	client := registry.NewClient(cfg.insecure)
+	client := registry.NewClientProxy(cfg.insecure, proxyURL)
 	log.Printf("resolving %s (%s) from %s ...", ref.Reference.Name(), plat, ref.Registry)
-	mfst, err := registry.ResolveManifest(ctx, ref.Reference, plat, keychain)
+	mfst, err := registry.ResolveManifestOpts(ctx, ref.Reference, plat, keychain, registry.ManifestFetchOptions{
+		Proxy: proxyURL,
+		Log:   func(f string, a ...any) { log.Printf(f, a...) },
+	})
 	if err != nil {
 		log.Println(err)
 		return 1
@@ -283,9 +328,13 @@ func pull(ctx context.Context, cfg pullConfig) int {
 		if daemon != nil {
 			defer daemon.Stop()
 		}
-		auth := registry.NewAuthenticator(ref.Reference.Context(), keychain, cfg.insecure)
+		auth := registry.NewAuthenticatorProxy(ref.Reference.Context(), keychain, cfg.insecure, proxyURL)
+		schedProxy := cfg.proxy
+		if proxyURL != nil && proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
+			schedProxy = "" // aria2 cannot use SOCKS; keep layer downloads direct
+		}
 		sched := downloader.NewScheduler(rpc, client, auth, ref.Reference.Context(), p,
-			downloader.SchedulerOptions{Concurrency: cfg.concurrency, MaxRetries: cfg.maxRetries})
+			downloader.SchedulerOptions{Concurrency: cfg.concurrency, MaxRetries: cfg.maxRetries, Proxy: schedProxy})
 		if err := sched.Run(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				log.Printf("interrupted — rerun the same command to resume from tmp/*.part")

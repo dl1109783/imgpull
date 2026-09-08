@@ -54,6 +54,11 @@ type ObjectTask struct {
 	LastError string
 	UpdatedAt time.Time
 
+	// RangeUnsupported records that the source answered a resume Range
+	// request with a full 200 body: the .part cannot be continued and is
+	// discarded before the next attempt re-downloads from scratch.
+	RangeUnsupported bool
+
 	hash v1.Hash
 }
 
@@ -192,10 +197,16 @@ func Build(ref *reference.Ref, mfst *registry.ImageManifest, plat *registry.Plat
 
 	// Reconcile each task against previous state and the filesystem.
 	for _, t := range p.Objects {
-		if o, ok := committed[t.Digest]; ok && o.Status == StatusCommitted {
-			t.Retries = o.Retries
-			if !opts.VerifyExisting {
-				t.Status = StatusCommitted
+		if o, ok := committed[t.Digest]; ok {
+			if o.Status == StatusCommitted {
+				t.Retries = o.Retries
+				if !opts.VerifyExisting {
+					t.Status = StatusCommitted
+				}
+			} else {
+				// Carry over what a previous run learned about this source,
+				// so the scheduler can warn up front instead of re-learning.
+				t.RangeUnsupported = o.RangeUnsupported
 			}
 		}
 		if err := p.reconcileTask(t, opts.VerifyExisting); err != nil {
@@ -388,6 +399,47 @@ func (p *Plan) MarkRetry(t *ObjectTask, err error) {
 	p.persistLocked()
 }
 
+// ForgetURL drops a remembered blob URL so the next attempt re-resolves it.
+func (p *Plan) ForgetURL(t *ObjectTask) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t.URL = ""
+	t.URLExpiresAt = nil
+	t.GID = ""
+	t.UpdatedAt = time.Now().UTC()
+	p.persistLocked()
+}
+
+// PopAltURL removes and returns the first alternate URL from t. Task fields
+// may only change under p.mu: persistLocked serializes them from other
+// goroutines' commit paths.
+func (p *Plan) PopAltURL(t *ObjectTask) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(t.AltURLs) == 0 {
+		return "", false
+	}
+	u := t.AltURLs[0]
+	t.AltURLs = t.AltURLs[1:]
+	t.UpdatedAt = time.Now().UTC()
+	p.persistLocked()
+	return u, true
+}
+
+// MarkRangeUnsupported records that the source rejected a resume Range
+// request, so the .part cannot be continued: the next attempt discards it
+// and re-downloads the object from scratch with a freshly resolved URL.
+func (p *Plan) MarkRangeUnsupported(t *ObjectTask) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t.RangeUnsupported = true
+	t.URL = ""
+	t.URLExpiresAt = nil
+	t.GID = ""
+	t.UpdatedAt = time.Now().UTC()
+	p.persistLocked()
+}
+
 // MarkFailed records a permanent failure.
 func (p *Plan) MarkFailed(t *ObjectTask, err error) {
 	p.mu.Lock()
@@ -465,6 +517,8 @@ func (p *Plan) persistLocked() error {
 			Retries:      t.Retries,
 			LastError:    t.LastError,
 			UpdatedAt:    t.UpdatedAt,
+
+			RangeUnsupported: t.RangeUnsupported,
 		})
 	}
 	return saveState(p.ImageDir, st)

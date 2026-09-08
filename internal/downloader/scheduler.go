@@ -24,6 +24,10 @@ type SchedulerOptions struct {
 	MaxRetries  int
 	// ProgressInterval controls the aggregate progress log cadence.
 	ProgressInterval time.Duration
+	// Proxy, when set, is passed to aria2 as the per-download all-proxy
+	// option so blob downloads go through it. Must be an http/https URL
+	// (aria2 has no SOCKS support); the RPC connection is never proxied.
+	Proxy string
 }
 
 // Scheduler submits plan tasks to aria2, watches them, verifies digests and
@@ -41,6 +45,8 @@ type Scheduler struct {
 	mu      sync.Mutex
 	live    map[string]*liveInfo // digest → progress of running tasks
 	started time.Time
+
+	rangeWarn sync.Once // "no resumable downloads here" warning, once per run
 }
 
 type liveInfo struct {
@@ -83,6 +89,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		return nil
 	}
 	s.started = time.Now()
+
+	// A previous run may already have proven this source un-resumable; say
+	// so up front instead of waiting for the first resume failure.
+	for _, t := range pending {
+		if t.RangeUnsupported {
+			s.warnNoResume()
+			break
+		}
+	}
 
 	// Stable order: small layers first for quick wins, keeps progress steady.
 	sort.Slice(pending, func(i, j int) bool { return pending[i].Size < pending[j].Size })
@@ -170,19 +185,23 @@ func (s *Scheduler) downloadObject(ctx context.Context, t *plan.ObjectTask) erro
 	// take a while on slow mirrors); waitTask keeps it updated afterwards.
 	s.setLive(t, &liveInfo{kind: t.Kind, state: "queue"})
 	defer s.setLive(t, nil)
+	// lastErr stays a local: task fields may only be mutated under plan.mu
+	// (persistLocked serializes them from other goroutines' commit paths);
+	// MarkRetry/MarkFailed store the message under the lock.
+	lastErr := ""
 	for attempt := 1; attempt <= s.opts.MaxRetries; attempt++ {
 		if attempt > 1 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			prevErr := errors.New("previous attempt failed")
-			if t.LastError != "" {
-				prevErr = errors.New(t.LastError)
+			if lastErr != "" {
+				prevErr = errors.New(lastErr)
 			}
 			s.plan.MarkRetry(t, prevErr)
 			wait := backoffDelay(attempt)
 			s.prog.Logf("retry %d/%d for %s in %s (%s)",
-				attempt-1, s.opts.MaxRetries-1, t.Digest, wait.Truncate(time.Millisecond), t.LastError)
+				attempt-1, s.opts.MaxRetries-1, t.Digest, wait.Truncate(time.Millisecond), lastErr)
 			if err := waitBackoff(ctx, attempt); err != nil {
 				return err
 			}
@@ -200,16 +219,16 @@ func (s *Scheduler) downloadObject(ctx context.Context, t *plan.ObjectTask) erro
 			s.prog.Logf("FAILED (fatal) %s %s: %v", t.Kind, t.Digest, err)
 			return err
 		}
-		t.LastError = err.Error()
+		lastErr = err.Error()
 		if isRetryable(err) {
 			continue
 		}
 		// Unclassified: treat as retryable.
 		continue
 	}
-	s.plan.MarkFailed(t, errors.New(t.LastError))
-	s.prog.Logf("FAILED %s %s after %d attempts: %s", t.Kind, t.Digest, s.opts.MaxRetries, t.LastError)
-	return fmt.Errorf("%s %s: %s", t.Kind, t.Digest, t.LastError)
+	s.plan.MarkFailed(t, errors.New(lastErr))
+	s.prog.Logf("FAILED %s %s after %d attempts: %s", t.Kind, t.Digest, s.opts.MaxRetries, lastErr)
+	return fmt.Errorf("%s %s: %s", t.Kind, t.Digest, lastErr)
 }
 
 // attempt performs one full download try for t: shortcut-complete .part
@@ -243,7 +262,7 @@ func (s *Scheduler) attempt(ctx context.Context, t *plan.ObjectTask) error {
 		if rerr != nil {
 			if errors.Is(rerr, registry.ErrBlobNotFound) {
 				// Try manifest-provided alternate URLs before giving up.
-				if u, ok := s.nextAltURL(t); ok {
+				if u, ok := s.plan.PopAltURL(t); ok {
 					s.plan.SetTask(t, plan.StatusDownloading, u, nil, "")
 					return s.waitTask(ctx, t, "")
 				}
@@ -251,6 +270,10 @@ func (s *Scheduler) attempt(ctx context.Context, t *plan.ObjectTask) error {
 				return nonRetryable(rerr)
 			}
 			return retryable(fmt.Errorf("resolve blob URL: %w", rerr))
+		}
+		if s.client.RangeUnsupported() {
+			s.plan.MarkRangeUnsupported(t)
+			s.warnNoResume()
 		}
 		s.plan.SetTask(t, plan.StatusDownloading, res.URL, expPtr(res.ExpiresAt), gid)
 		if res.ExpiresAt.Unix() > 0 {
@@ -291,16 +314,6 @@ func (s *Scheduler) currentHeaders() []string {
 	return []string{"Authorization: " + h}
 }
 
-// nextAltURL pops the next alternate URL from the task.
-func (s *Scheduler) nextAltURL(t *plan.ObjectTask) (string, bool) {
-	if len(t.AltURLs) == 0 {
-		return "", false
-	}
-	u := t.AltURLs[0]
-	t.AltURLs = t.AltURLs[1:]
-	return u, true
-}
-
 // precheck removes an oversized .part or orphaned .aria2 control file.
 func (s *Scheduler) precheck(t *plan.ObjectTask) {
 	part := s.plan.PartPath(t)
@@ -339,6 +352,11 @@ func (s *Scheduler) findExistingTask(ctx context.Context, part string) (string, 
 // submitAndWatch submits the task to aria2 then polls until completion.
 func (s *Scheduler) submitAndWatch(ctx context.Context, t *plan.ObjectTask, url string, headers []string, gid string) error {
 	if gid == "" {
+		// A fresh submission cannot continue a .part when the source ignores
+		// Range requests: aria2 would abort every attempt with code 8.
+		if t.RangeUnsupported || s.client.RangeUnsupported() {
+			s.discardUnresumablePart(t)
+		}
 		g, err := s.submitTask(ctx, t, url, headers)
 		if err != nil {
 			return err
@@ -347,6 +365,31 @@ func (s *Scheduler) submitAndWatch(ctx context.Context, t *plan.ObjectTask, url 
 		s.plan.SetTask(t, plan.StatusDownloading, url, nil, gid)
 	}
 	return s.waitTask(ctx, t, gid)
+}
+
+// warnNoResume marks in the log (once per run) that this source cannot host
+// resumable downloads, so .part files are discarded on every interruption.
+func (s *Scheduler) warnNoResume() {
+	s.rangeWarn.Do(func() {
+		s.prog.Logf("%s does not support resumable downloads (ignores Range requests); interrupted layers restart from scratch",
+			s.plan.Registry)
+	})
+}
+
+// discardUnresumablePart removes a partial .part (and its aria2 control
+// file) that cannot be resumed because the source ignores Range requests;
+// the object restarts from scratch.
+func (s *Scheduler) discardUnresumablePart(t *plan.ObjectTask) {
+	s.warnNoResume()
+	part := s.plan.PartPath(t)
+	fi, err := os.Stat(part)
+	if err != nil || fi.Size() == 0 {
+		return
+	}
+	os.Remove(part)
+	os.Remove(part + ".aria2")
+	s.prog.Logf("%s: source ignores Range requests; discarding %s partial, restarting this object",
+		short(t.Digest), fsx.HumanSize(fi.Size()))
 }
 
 // submitTask adds the URI with per-task options; on "unknown option"
@@ -371,6 +414,9 @@ func (s *Scheduler) submitTask(ctx context.Context, t *plan.ObjectTask, url stri
 		// aria2 spells the algorithm with a hyphen (sha-256), v1.Hash without it.
 		opts["checksum"] = fmt.Sprintf("sha-%s=%s", strings.TrimPrefix(h.Algorithm, "sha"), h.Hex)
 	}
+	if s.opts.Proxy != "" {
+		opts["all-proxy"] = s.opts.Proxy
+	}
 	for drop := 0; ; drop++ {
 		gid, err := s.rpc.AddURI(ctx, []string{url}, opts)
 		if err == nil {
@@ -387,6 +433,9 @@ func (s *Scheduler) submitTask(ctx context.Context, t *plan.ObjectTask, url stri
 			delete(opts, "checksum")
 			if _, has := opts["header"]; has && drop >= 1 {
 				delete(opts, "header")
+			}
+			if _, has := opts["all-proxy"]; has && drop >= 2 {
+				delete(opts, "all-proxy")
 			}
 			continue
 		}
@@ -444,6 +493,27 @@ func (s *Scheduler) waitTask(ctx context.Context, t *plan.ObjectTask, gid string
 			return retryable(fmt.Errorf("aria2 finished but %s is missing/wrong size", part))
 		case "error":
 			s.rpc.RemoveDownloadResult(context.Background(), gid)
+			if st.ErrorCode == "8" {
+				// "No URI available": aria2 aborted without transferring. On
+				// a Range-blind source this is the resume being rejected; a
+				// stale/expired URL can also trigger it. Probe the source
+				// once to tell these apart, then force a re-resolve either
+				// way so the next attempt cannot resubmit the same URL.
+				pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				blind := t.RangeUnsupported || s.client.RangeUnsupported() ||
+					s.client.ProbeRangeBlind(pctx, t.URL, s.currentHeaders())
+				cancel()
+				if blind {
+					if !t.RangeUnsupported {
+						s.prog.Logf("%s: source ignores Range requests; the partial cannot be resumed",
+							short(t.Digest))
+					}
+					s.warnNoResume()
+					s.plan.MarkRangeUnsupported(t)
+				} else {
+					s.plan.ForgetURL(t)
+				}
+			}
 			ferr := classifyAria2Failure(st)
 			s.clearLive()
 			return ferr
