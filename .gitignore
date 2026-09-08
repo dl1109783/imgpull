@@ -1,0 +1,11 @@
+# Build artifacts
+/bin/
+
+# Downloaded images / working state
+downloads/
+*.part
+*.part.aria2
+
+# Go
+*.test
+*.out
