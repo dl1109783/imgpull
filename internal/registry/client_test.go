@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,14 +230,86 @@ func TestResolveBlobNotFound(t *testing.T) {
 		head: func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 		},
+		get: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
 	})
 	c := NewClient(false)
 	_, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:abc", nil)
 	if !errors.Is(err, ErrBlobNotFound) {
 		t.Fatalf("err = %v, want ErrBlobNotFound", err)
 	}
+	// A HEAD 404 is confirmed by one ranged GET before it counts, and the
+	// verdict needs three consecutive strikes (flaky cache-front mirrors).
+	head, get := ps.calls()
+	if head != 3 || get != 3 {
+		t.Errorf("HEAD/GET calls = %d/%d, want 3/3 (strike budget)", head, get)
+	}
+}
+
+// TestResolveHead404FallsBackToSignedGET emulates ghcr.1ms.run: blob HEADs
+// always 404 while a ranged GET answers with a cross-host signed redirect.
+func TestResolveHead404FallsBackToSignedGET(t *testing.T) {
+	ps := newProbeServer(t, probeHooks{
+		head: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+		get: func(w http.ResponseWriter, r *http.Request) {
+			if got := r.Header.Get("Range"); got != "bytes=0-0" {
+				t.Errorf("Range header = %q, want bytes=0-0", got)
+			}
+			w.Header().Set("Location", "https://cdn.example.com/blob?se=2026-01-02T03:04:05Z")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		},
+	})
+	c := NewClient(false)
+	res, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:abc", nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := "https://cdn.example.com/blob?se=2026-01-02T03:04:05Z"; res.URL != want {
+		t.Errorf("URL = %q, want %q", res.URL, want)
+	}
+	if len(res.Headers) != 0 {
+		t.Errorf("auth must be stripped for signed URLs, got %v", res.Headers)
+	}
+	if !c.skipHead.Load() {
+		t.Errorf("skipHead not latched after a HEAD 404 disproved by GET")
+	}
+
+	// The next resolve must skip HEAD entirely.
+	if _, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:def", nil); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
 	if head, _ := ps.calls(); head != 1 {
-		t.Errorf("HEAD calls = %d, want 1 (no retries on 404)", head)
+		t.Errorf("HEAD calls = %d, want 1 (latched)", head)
+	}
+}
+
+// TestResolveFlaky404Retries emulates an edge pool where some nodes 404
+// uncached blobs: the first ranged GET misses, the retry succeeds.
+func TestResolveFlaky404Retries(t *testing.T) {
+	var gets int32
+	ps := newProbeServer(t, probeHooks{
+		head: func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+		get: func(w http.ResponseWriter, r *http.Request) {
+			if atomic.AddInt32(&gets, 1) == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Location", "https://cdn.example.com/blob?sig=x")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		},
+	})
+	c := NewClient(false)
+	res, err := c.ResolveBlobURL(context.Background(), ps.repo, "sha256:abc", nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := "https://cdn.example.com/blob?sig=x"; res.URL != want {
+		t.Errorf("URL = %q, want %q", res.URL, want)
 	}
 }
 

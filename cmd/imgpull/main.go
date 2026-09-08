@@ -27,7 +27,7 @@ import (
 	"imgpull/internal/registry"
 )
 
-const imgpullVersion = "0.2.4"
+const imgpullVersion = "0.2.5"
 
 // valueFlags are options whose value may be the next argv element.
 var valueFlags = map[string]bool{

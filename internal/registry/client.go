@@ -44,8 +44,9 @@ type Client struct {
 	// answer HEAD for blobs they must fetch from upstream first — without a
 	// bound the resolve would stall for minutes.
 	headTimeout time.Duration
-	// skipHead latches once HEAD proves useless for this registry (hang or
-	// 405), so later blobs probe with a ranged GET immediately.
+	// skipHead latches once HEAD proves useless for this registry (hang,
+	// 405, or a 404 that a ranged GET disproved), so later blobs probe with
+	// a ranged GET immediately.
 	skipHead atomic.Bool
 	// rangeBlind latches once the registry answers a ranged GET with a full
 	// 200 body: it ignores Range, so aria2 can never resume a .part here.
@@ -103,6 +104,7 @@ func (c *Client) blobURL(repo name.Repository, digest string) string {
 // like docker.io that 307 to storage). Retries transient auth failures.
 func (c *Client) ResolveBlobURL(ctx context.Context, repo name.Repository, digest string, auth *Authenticator) (*ResolvedURL, error) {
 	var lastErr error
+	notFound := 0
 	for attempt := 0; attempt < 3; attempt++ {
 		res, err := c.resolveBlobURLOnce(ctx, repo, digest, auth)
 		if err == nil {
@@ -113,13 +115,18 @@ func (c *Client) ResolveBlobURL(ctx context.Context, repo name.Repository, diges
 			auth.Invalidate()
 			continue
 		}
-		if errors.Is(err, ErrBlobNotFound) {
-			return nil, err
-		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
-		// Other errors: brief pause then retry.
+		if errors.Is(err, ErrBlobNotFound) {
+			// Cache-front mirrors 404 flakily on some edge nodes; demand
+			// several consecutive verdicts before declaring the blob
+			// missing.
+			if notFound++; notFound >= 3 {
+				return nil, err
+			}
+		}
+		// Other errors and unconfirmed 404s: brief pause then retry.
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -212,7 +219,16 @@ func (c *Client) resolveBlobURLOnce(ctx context.Context, repo name.Repository, d
 			return c.resolveViaRangeGet(ctx, repo, digest, header)
 
 		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest:
-			return nil, fmt.Errorf("%w: %s", ErrBlobNotFound, digest)
+			// Cache-front mirrors may 404 blob HEADs while GET serves a
+			// signed redirect (ghcr.1ms.run). Confirm with a ranged GET
+			// before declaring the blob missing; success also latches
+			// skipHead so later blobs skip the lying HEAD.
+			res, gerr := c.resolveViaRangeGet(ctx, repo, digest, header)
+			if gerr == nil {
+				c.skipHead.Store(true)
+				return res, nil
+			}
+			return nil, gerr
 
 		default:
 			// 5xx and friends: the ranged GET may still be served.
@@ -223,7 +239,8 @@ func (c *Client) resolveBlobURLOnce(ctx context.Context, repo name.Repository, d
 }
 
 // resolveViaRangeGet falls back to GET with Range: bytes=0-0 for registries
-// that reject HEAD requests.
+// that reject HEAD requests (405), hang on them, or answer them with a
+// misleading 404 while GET works.
 func (c *Client) resolveViaRangeGet(ctx context.Context, repo name.Repository, digest, header string) (*ResolvedURL, error) {
 	url := c.blobURL(repo, digest)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

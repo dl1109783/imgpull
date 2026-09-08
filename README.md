@@ -98,6 +98,28 @@ imgpull 默认读取 **docker 配置文件**（`~/.docker/config.json`，可用 
 
 显式传 `-u user -P pass` 时优先使用显式凭据；两者都没有时按匿名拉取。
 
+## 导入本地 Docker
+
+imgpull 的产物是标准 OCI Image Layout（skopeo / podman / containerd / crane 可直接读取）；要导入本地 Docker，加 `-e docker-archive` 导出 `image.tar` 后 `docker load` 即可：
+
+```bash
+# 下载的同时导出 docker-archive
+imgpull ghcr.1ms.run/pocketpairjp/palserver:latest -o /vol1/1000 -e docker-archive
+
+# 导入本地 docker
+docker load -i /vol1/1000/ghcr.1ms.run/pocketpairjp/palserver/latest/image.tar
+```
+
+**对已经下载完成的镜像**，补导出不需要重新下载：重跑同一条引用命令并加上 `-e docker-archive`，imgpull 校验既有 blob 后直接导出（日志显示 `all blobs already present and verified`，秒级完成，不会重新下载任何层）：
+
+```bash
+imgpull ghcr.1ms.run/pocketpairjp/palserver:latest -o /vol1/1000 -e docker-archive
+```
+
+- `image.tar` 写在 layout 目录下（见「目录布局」）；导入后的镜像名/标签与拉取时的引用一致（如 `ghcr.1ms.run/pocketpairjp/palserver:latest`），需要短名可用 `docker tag` 改名。
+- `image.tar` 可拷贝到其他机器直接 `docker load -i` 使用，对方无需安装 imgpull。
+- 磁盘紧张时 `image.tar` 与 layout 目录二选一保留：删 tar 后随时可从 layout 重新导出；删 layout 不影响已导入 docker 的镜像，但会失去续传与重新导出能力。
+
 ## 代理
 
 `--proxy`（简写 `-x`）为两类网络访问统一设置代理，适合 docker.io 被 DNS 污染、只能走代理的环境：
@@ -198,3 +220,11 @@ aria2 无法在其上续传 `.part` 文件（报 `code 8: No URI available.`）�
 并打印 `source ignores Range requests; discarding … partial` 提示。在此类源上
 中断重跑意味着该层从头下载，属预期行为；若希望获得可续传的下载，请改用支持
 Range 的源或官方 registry。
+
+### 对 blob HEAD 返回 404 的镜像源
+
+个别缓存型镜像源（如 ghcr.1ms.run）对 blob 的 `HEAD` 探测一律返回 404，但对
+`GET` 正常应答（307 跳转到签名下载地址）。imgpull 0.2.5 起，HEAD 收到 404/400
+时会先用 1 字节 `Range GET` 复核，复核通过即改走 GET 解析并记住该源（后续
+blob 直接跳过 HEAD）；边缘节点偶发的抖动 404 也会在连续 3 次确认后才判失败，
+无需手动干预。
